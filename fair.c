@@ -8983,10 +8983,12 @@ again:
 	p = pick_task_fair(rq);
 	if (!p)
 		goto idle;
+
+	/* --- ここから: Entanglement 相互排他チェック --- */
+	{
 		unsigned int c1 = READ_ONCE(sysctl_entangled_cpu1);
 		unsigned int c2 = READ_ONCE(sysctl_entangled_cpu2);
 
-		/* 2つのCPU値が異なり、Entanglementが有効な場合のみ評価 */
 		if (c1 != c2) {
 			int this_cpu = cpu_of(rq);
 			int other_cpu = -1;
@@ -8996,29 +8998,41 @@ again:
 			else if (this_cpu == c2)
 				other_cpu = c1;
 
-			/* 安全のためのCPUインデックス範囲チェック */
 			if (other_cpu >= 0 && other_cpu < nr_cpu_ids) {
 				struct rq *other_rq = cpu_rq(other_cpu);
+				struct task_struct *other_curr;
+				bool conflict = false;
+
+				rcu_read_lock();
+				other_curr = READ_ONCE(other_rq->curr);
 				
-				/* * 【重要】他CPUのランキューロックは取得しない (READ_ONCEを使用)
-				 * ロックを取得するとAB-BAデッドロックでカーネルパニックになるため
-				 */
-				struct task_struct *other_curr = READ_ONCE(other_rq->curr);
-
-				/* 相手のCPUがアイドルタスク(pid == 0)ではなく、何らかの処理を実行中の場合 */
+				/* 他のCPUがアイドルタスク(PID 0)ではなく、何らかの処理を実行中の場合 */
 				if (other_curr && other_curr->pid != 0) {
-					kuid_t this_uid, other_uid;
+					/* * 【最重要修正1】クレデンシャルの NULL チェック
+					 * other_curr が終了中(do_exit)の場合、cred は NULL になる。
+					 * task_uid() を直接使わず、rcu_dereference で取得して安全を確認する。
+					 */
+					const struct cred *p_cred = rcu_dereference(p->cred);
+					const struct cred *o_cred = rcu_dereference(other_curr->cred);
 
-					/* クレデンシャルへのアクセスはRCUで保護する */
-					rcu_read_lock();
-					this_uid = task_uid(p);
-					other_uid = task_uid(other_curr);
-					rcu_read_unlock();
-
-					/* 実行ユーザーが異なる場合はスケジューリングを拒否 */
-					if (!uid_eq(this_uid, other_uid)) {
-						return NULL; /* CFSとしては選出タスクなしとして扱い、Idleクラスへ渡す */
+					if (p_cred && o_cred) {
+						if (!uid_eq(p_cred->uid, o_cred->uid)) {
+							conflict = true;
+						}
 					}
+				}
+				rcu_read_unlock();
+
+				if (conflict) {
+					/* * 【最重要修正2】無限ループとランキュー状態の破損回避
+					 * CFS にタスクが残っていても強制的に CPU を Idle にするため、
+					 * 直前まで動いていたタスク (prev) の退避処理をカーネルの作法通りに
+					 * 完了させてから、NULL を返す。
+					 */
+					if (prev)
+						put_prev_task(rq, prev);
+					
+					return NULL; /* コアスケジューラはこれを見て Idle クラスへ移行する */
 				}
 			}
 		}
