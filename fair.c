@@ -8985,13 +8985,12 @@ again:
 	p = pick_task_fair(rq);
 	if (!p) {
 #ifdef CONFIG_SMP
-		/* 実行するタスクが無いので Intent を下ろす */
 		sysctl_entanglement_intent[cpu_of(rq)] = 0;
 #endif
 		goto idle;
 	}
 
-	/* --- ここから: Entanglement 相互排他 (Petersonのアルゴリズム) --- */
+	/* --- ここから: Entanglement 相互排他 --- */
 #ifdef CONFIG_SMP
 	{
 		unsigned int c1 = READ_ONCE(sysctl_entangled_cpu1);
@@ -9014,9 +9013,9 @@ again:
 				rcu_read_unlock();
 
 				if (has_cred) {
-					/* 【最重要】相手を確認する前に「自分はこのUIDを実行したい」と宣言する */
+					/* 相手を見る前に「自分はこのUIDを実行する」と宣言 (Petersonのアルゴリズム) */
 					sysctl_entanglement_uid[this_cpu] = p_uid.val;
-					smp_store_mb(sysctl_entanglement_intent[this_cpu], 1); // メモリバリア
+					smp_store_mb(sysctl_entanglement_intent[this_cpu], 1); // メモリバリアで同期
 
 					bool conflict = false;
 					struct rq *other_rq = cpu_rq(other_cpu);
@@ -9026,7 +9025,6 @@ again:
 
 					rcu_read_lock();
 					other_curr = READ_ONCE(other_rq->curr);
-					/* パターンA: 相手が実際に何かのタスクを実行中の場合 */
 					if (other_curr && other_curr->pid != 0) {
 						const struct cred *o_cred = rcu_dereference(other_curr->cred);
 						if (o_cred) {
@@ -9036,27 +9034,32 @@ again:
 					}
 					rcu_read_unlock();
 
+					/* 競合の判定 */
 					if (other_valid) {
 						if (p_uid.val != other_curr_uid.val) {
-							conflict = true; /* 違うユーザーが実行中なら衝突 */
+							conflict = true;
 						}
 					} else {
-						/* パターンB: 相手はアイドルだが、同時にタスクを起動しようとしている場合 */
+						/* 相手がアイドルでも、同時に起動しようとしていたらタイブレーカー発動 */
 						if (sysctl_entanglement_intent[other_cpu]) {
 							uid_t other_intent_uid = sysctl_entanglement_uid[other_cpu];
 							if (p_uid.val != other_intent_uid) {
-								/* 衝突発生！ CPU番号が大きい方が必ず身を引いて譲る (Tie-breaker) */
 								if (this_cpu > other_cpu) {
-									conflict = true;
+									conflict = true; /* 番号が大きい方が身を引く */
 								}
 							}
 						}
 					}
 
-					/* 衝突した場合は、危険なツリー探索をせず素直にアイドルで待機(ビジーウェイト)する */
+					/* 競合時の究極の安全策 */
 					if (conflict) {
-						p = NULL;
-						goto idle;
+						/* 【最重要】ここで必ず prev を始末して Dangling Pointer を防ぐ！ */
+						if (prev) {
+							put_prev_task(rq, prev);
+							prev = NULL; /* 二重put防止 */
+						}
+						/* goto idle せず、直接 NULL を返して安全にアイドルスレッドへ移行する */
+						return NULL; 
 					}
 				}
 			}
