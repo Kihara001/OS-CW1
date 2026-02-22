@@ -9053,13 +9053,8 @@ again:
 
 					/* 競合時の究極の安全策 */
 					if (conflict) {
-						/* 【最重要】ここで必ず prev を始末して Dangling Pointer を防ぐ！ */
-						if (prev) {
-							put_prev_task(rq, prev);
-							prev = NULL; /* 二重put防止 */
-						}
-						/* goto idle せず、直接 NULL を返して安全にアイドルスレッドへ移行する */
-						return NULL; 
+						sysctl_entanglement_intent[this_cpu] = 0;  // intentもクリア
+						goto idle;  // 正規のアイドルパスを使う
 					}
 				}
 			}
