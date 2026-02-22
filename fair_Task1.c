@@ -9030,6 +9030,7 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
 	struct sched_entity *se;
 	struct task_struct *p;
 	int new_tasks;
+	bool entangled_block = false;
 
 again:
 	p = pick_task_fair(rq);
@@ -9064,6 +9065,7 @@ again:
 					    partner_curr->mm &&
 					    partner_curr->pid > 0 &&
 					    task_uid(partner_curr).val != task_uid(p).val) {
+						entangled_block = true;
 						goto idle;
 					}
 				}
@@ -9122,7 +9124,7 @@ simple:
 	return p;
 
 idle:
-	if (rf) {
+	if (rf && !entangled_block) {
 		new_tasks = sched_balance_newidle(rq, rf);
 
 		/*
