@@ -130,7 +130,8 @@ static unsigned int sysctl_sched_cfs_bandwidth_slice		= 5000UL;
 static unsigned int sysctl_numa_balancing_promote_rate_limit = 65536;
 static unsigned int sysctl_entangled_cpu1 = 0;
 static unsigned int sysctl_entangled_cpu2 = 0;
-static volatile int sysctl_entanglement_yield[NR_CPUS] = {0};
+static volatile int sysctl_entanglement_intent[NR_CPUS] = {0};
+static volatile uid_t sysctl_entanglement_uid[NR_CPUS] = {0};
 #endif
 
 #ifdef CONFIG_SYSCTL
@@ -8984,12 +8985,13 @@ again:
 	p = pick_task_fair(rq);
 	if (!p) {
 #ifdef CONFIG_SMP
-		sysctl_entanglement_yield[cpu_of(rq)] = 0;
+		/* 実行するタスクが無いので Intent を下ろす */
+		sysctl_entanglement_intent[cpu_of(rq)] = 0;
 #endif
 		goto idle;
 	}
 
-	/* --- ここから: Entanglement 相互排他チェック --- */
+	/* --- ここから: Entanglement 相互排他 (Petersonのアルゴリズム) --- */
 #ifdef CONFIG_SMP
 	{
 		unsigned int c1 = READ_ONCE(sysctl_entangled_cpu1);
@@ -9000,88 +9002,66 @@ again:
 			int other_cpu = (this_cpu == c1) ? c2 : c1;
 
 			if (other_cpu >= 0 && other_cpu < nr_cpu_ids) {
-				struct rq *other_rq = cpu_rq(other_cpu);
-				struct task_struct *other_curr;
-				kuid_t other_uid;
-				bool other_valid = false;
+				kuid_t p_uid;
+				bool has_cred = false;
 
-				/* 相手のCPUの状態を安全に取得 */
 				rcu_read_lock();
-				other_curr = READ_ONCE(other_rq->curr);
-				if (other_curr && other_curr->pid != 0) {
-					const struct cred *o_cred = rcu_dereference(other_curr->cred);
-					if (o_cred) {
-						other_uid = o_cred->uid;
-						other_valid = true;
-					}
+				const struct cred *p_cred = rcu_dereference(p->cred);
+				if (p_cred) {
+					p_uid = p_cred->uid;
+					has_cred = true;
 				}
 				rcu_read_unlock();
 
-				bool conflict = false;
+				if (has_cred) {
+					/* 【最重要】相手を確認する前に「自分はこのUIDを実行したい」と宣言する */
+					sysctl_entanglement_uid[this_cpu] = p_uid.val;
+					smp_store_mb(sysctl_entanglement_intent[this_cpu], 1); // メモリバリア
 
-				/* ① 現在選ばれているタスク (p) との競合チェック */
-				if (other_valid) {
+					bool conflict = false;
+					struct rq *other_rq = cpu_rq(other_cpu);
+					struct task_struct *other_curr;
+					bool other_valid = false;
+					kuid_t other_curr_uid;
+
 					rcu_read_lock();
-					const struct cred *p_cred = rcu_dereference(p->cred);
-					if (p_cred && !uid_eq(p_cred->uid, other_uid)) {
-						conflict = true;
+					other_curr = READ_ONCE(other_rq->curr);
+					/* パターンA: 相手が実際に何かのタスクを実行中の場合 */
+					if (other_curr && other_curr->pid != 0) {
+						const struct cred *o_cred = rcu_dereference(other_curr->cred);
+						if (o_cred) {
+							other_curr_uid = o_cred->uid;
+							other_valid = true;
+						}
 					}
 					rcu_read_unlock();
-				} else {
-					/* ② 相手がアイドルの場合：同時起床レースをタイブレーカーで防ぐ */
-					if (sysctl_entanglement_yield[other_cpu] && this_cpu > other_cpu) {
-						conflict = true; /* CPU番号が大きい方は待つ */
-					}
-				}
 
-				/* 競合が発生した場合、安全に別のタスクを探す */
-				if (conflict) {
-					bool found = false;
-					struct task_struct *t;
-
-					list_for_each_entry(t, &rq->cfs_tasks, se.group_node) {
-						if (!t || t->pid == 0) continue;
-						
-						/* 【超重要: Division Error / Null Pointer の完全防止】
-						 * スリープ中のタスクは絶対に選ばない！ */
-						if (!t->se.on_rq) continue;
-
-						bool t_conflict = false;
-						if (other_valid) {
-							rcu_read_lock();
-							const struct cred *t_cred = rcu_dereference(t->cred);
-							if (t_cred && !uid_eq(t_cred->uid, other_uid)) {
-								t_conflict = true;
-							}
-							rcu_read_unlock();
-						} else {
-							/* リスト内の別タスクでもタイブレーカーを適用 */
-							if (sysctl_entanglement_yield[other_cpu] && this_cpu > other_cpu) {
-								t_conflict = true;
-							}
+					if (other_valid) {
+						if (p_uid.val != other_curr_uid.val) {
+							conflict = true; /* 違うユーザーが実行中なら衝突 */
 						}
-
-						/* 競合しない安全な実行可能タスクを発見 */
-						if (!t_conflict) {
-							p = t;
-							found = true;
-							break;
+					} else {
+						/* パターンB: 相手はアイドルだが、同時にタスクを起動しようとしている場合 */
+						if (sysctl_entanglement_intent[other_cpu]) {
+							uid_t other_intent_uid = sysctl_entanglement_uid[other_cpu];
+							if (p_uid.val != other_intent_uid) {
+								/* 衝突発生！ CPU番号が大きい方が必ず身を引いて譲る (Tie-breaker) */
+								if (this_cpu > other_cpu) {
+									conflict = true;
+								}
+							}
 						}
 					}
 
-					/* 安全なタスクが一つも無ければ、Yieldフラグを立ててアイドルへ逃げる */
-					if (!found) {
-						sysctl_entanglement_yield[this_cpu] = 1;
+					/* 衝突した場合は、危険なツリー探索をせず素直にアイドルで待機(ビジーウェイト)する */
+					if (conflict) {
 						p = NULL;
 						goto idle;
 					}
 				}
-				
-				/* 安全にスケジュールされることが確定したので、Yieldフラグを解除 */
-				sysctl_entanglement_yield[this_cpu] = 0;
 			}
 		} else {
-			sysctl_entanglement_yield[this_cpu] = 0;
+			sysctl_entanglement_intent[this_cpu] = 0;
 		}
 	}
 #endif
