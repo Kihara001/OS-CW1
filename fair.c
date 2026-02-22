@@ -9001,6 +9001,7 @@ again:
 			struct task_struct *other_curr;
 			uid_t p_uid = 0, other_uid = 0;
 			bool conflict = false;
+			int retries = 1000;
 
 			rcu_read_lock();
 			if (p->cred)
