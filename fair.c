@@ -37,7 +37,6 @@
 #include <linux/sched/cputime.h>
 #include <linux/sched/isolation.h>
 #include <linux/sched/nohz.h>
-#include <linux/cred.h>
 
 #include <linux/cpuidle.h>
 #include <linux/interrupt.h>
@@ -51,7 +50,8 @@
 #include <linux/rbtree_augmented.h>
 
 #include <asm/switch_to.h>
-
+#include <linux/cred.h>
+#include <linux/uidgid.h>
 #include "sched.h"
 #include "stats.h"
 #include "autogroup.h"
@@ -128,11 +128,9 @@ static unsigned int sysctl_sched_cfs_bandwidth_slice		= 5000UL;
 #ifdef CONFIG_NUMA_BALANCING
 /* Restrict the NUMA promotion throughput (MB/s) for each target node. */
 static unsigned int sysctl_numa_balancing_promote_rate_limit = 65536;
-#endif
-
-/* Entangled CPUs for cross-CPU mutual exclusion */
 static unsigned int sysctl_entangled_cpu1 = 0;
 static unsigned int sysctl_entangled_cpu2 = 0;
+#endif
 
 #ifdef CONFIG_SYSCTL
 static struct ctl_table sched_fair_sysctls[] = {
@@ -157,19 +155,19 @@ static struct ctl_table sched_fair_sysctls[] = {
 	},
 #endif /* CONFIG_NUMA_BALANCING */
 	{
-		.procname	= "entangled_cpus_1",
-		.data		= &sysctl_entangled_cpu1,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec_minmax,
-	},
-	{
-		.procname	= "entangled_cpus_2",
-		.data		= &sysctl_entangled_cpu2,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec_minmax,
-	},
+        .procname       = "entangled_cpus_1",
+        .data           = &sysctl_entangled_cpu1,
+        .maxlen         = sizeof(unsigned int),
+        .mode           = 0644,
+        .proc_handler   = proc_dointvec_minmax,
+    },
+    {
+        .procname       = "entangled_cpus_2",
+        .data           = &sysctl_entangled_cpu2,
+        .maxlen         = sizeof(unsigned int),
+        .mode           = 0644,
+        .proc_handler   = proc_dointvec_minmax,
+    },
 };
 
 static int __init sched_fair_sysctl_init(void)
@@ -8948,8 +8946,6 @@ static struct task_struct *pick_task_fair(struct rq *rq)
 {
 	struct sched_entity *se;
 	struct cfs_rq *cfs_rq;
-	unsigned int cpu1, cpu2;
-	int this_cpu;
 
 again:
 	cfs_rq = &rq->cfs;
@@ -8970,54 +8966,6 @@ again:
 		cfs_rq = group_cfs_rq(se);
 	} while (cfs_rq);
 
-	/* Entanglement check: cross-CPU mutual exclusion based on user ID */
-	cpu1 = READ_ONCE(sysctl_entangled_cpu1);
-	cpu2 = READ_ONCE(sysctl_entangled_cpu2);
-	this_cpu = cpu_of(rq);
-
-	/* Only check if entanglement is enabled (cpu1 != cpu2) */
-	if (cpu1 != cpu2) {
-		int other_cpu = -1;
-		struct task_struct *candidate = task_of(se);
-
-		/* Determine if this CPU is one of the entangled pair */
-		if (this_cpu == cpu1)
-			other_cpu = cpu2;
-		else if (this_cpu == cpu2)
-			other_cpu = cpu1;
-
-		if (other_cpu >= 0 && cpu_online(other_cpu)) {
-			struct rq *other_rq = cpu_rq(other_cpu);
-			struct task_struct *other_task = other_rq->curr;
-
-			/* Check if the other CPU is running a real task (not idle) */
-			if (other_task && !is_idle_task(other_task)) {
-				kuid_t candidate_uid = task_uid(candidate);
-				kuid_t other_uid = task_uid(other_task);
-
-				/* If different users, skip this candidate */
-				if (!uid_eq(candidate_uid, other_uid)) {
-					/* Try to find another task in the runqueue */
-					struct rb_node *next_node;
-					struct sched_entity *next_se;
-
-					next_node = rb_next(&se->run_node);
-					while (next_node) {
-						next_se = rb_entry(next_node, struct sched_entity, run_node);
-						if (entity_is_task(next_se)) {
-							struct task_struct *next_task = task_of(next_se);
-							if (uid_eq(task_uid(next_task), other_uid))
-								return next_task;
-						}
-						next_node = rb_next(next_node);
-					}
-					/* No compatible task found, return NULL to idle */
-					return NULL;
-				}
-			}
-		}
-	}
-
 	return task_of(se);
 }
 
@@ -9030,49 +8978,52 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
 	struct sched_entity *se;
 	struct task_struct *p;
 	int new_tasks;
-	int entangled_block = 0;
 
 again:
 	p = pick_task_fair(rq);
 	if (!p)
 		goto idle;
+		unsigned int c1 = READ_ONCE(sysctl_entangled_cpu1);
+		unsigned int c2 = READ_ONCE(sysctl_entangled_cpu2);
 
-	/* Entangled CPU mutual exclusion - Task 1 */
-	{
-		unsigned int e1 = READ_ONCE(sysctl_entangled_cpu1);
-		unsigned int e2 = READ_ONCE(sysctl_entangled_cpu2);
+		/* 2つのCPU値が異なり、Entanglementが有効な場合のみ評価 */
+		if (c1 != c2) {
+			int this_cpu = cpu_of(rq);
+			int other_cpu = -1;
 
-		/* Only check if entanglement is enabled (e1 != e2) */
-		if (e1 != e2) {
-			int cpu = rq->cpu;
+			if (this_cpu == c1)
+				other_cpu = c2;
+			else if (this_cpu == c2)
+				other_cpu = c1;
 
-			/* Check if this CPU is one of the entangled pair */
-			if (cpu == (int)e1 || cpu == (int)e2) {
-				int partner = (cpu == (int)e1) ? (int)e2 : (int)e1;
+			/* 安全のためのCPUインデックス範囲チェック */
+			if (other_cpu >= 0 && other_cpu < nr_cpu_ids) {
+				struct rq *other_rq = cpu_rq(other_cpu);
+				
+				/* * 【重要】他CPUのランキューロックは取得しない (READ_ONCEを使用)
+				 * ロックを取得するとAB-BAデッドロックでカーネルパニックになるため
+				 */
+				struct task_struct *other_curr = READ_ONCE(other_rq->curr);
 
-				if (cpu_online(partner)) {
-					struct rq *partner_rq = cpu_rq(partner);
-					struct task_struct *partner_curr = READ_ONCE(partner_rq->curr);
+				/* 相手のCPUがアイドルタスク(pid == 0)ではなく、何らかの処理を実行中の場合 */
+				if (other_curr && other_curr->pid != 0) {
+					kuid_t this_uid, other_uid;
 
-					/*
-					 * Block scheduling if:
-					 * 1. p is a real user task (has mm and pid > 0)
-					 * 2. Partner is running a real user task (not idle, not kernel thread)
-					 * 3. They have different UIDs
-					 */
-					if (p->mm && p->pid > 0 &&
-					    partner_curr &&
-					    partner_curr->mm &&
-					    partner_curr->pid > 0 &&
-					    task_uid(partner_curr).val != task_uid(p).val) {
-						entangled_block = 1;
-						p = NULL;
-						goto idle;
+					/* クレデンシャルへのアクセスはRCUで保護する */
+					rcu_read_lock();
+					this_uid = task_uid(p);
+					other_uid = task_uid(other_curr);
+					rcu_read_unlock();
+
+					/* 実行ユーザーが異なる場合はスケジューリングを拒否 */
+					if (!uid_eq(this_uid, other_uid)) {
+						return NULL; /* CFSとしては選出タスクなしとして扱い、Idleクラスへ渡す */
 					}
 				}
 			}
 		}
 	}
+	/* --- ここまで --- */
 
 	se = &p->se;
 
@@ -9125,7 +9076,7 @@ simple:
 	return p;
 
 idle:
-	if (rf && !entangled_block) {
+	if (rf) {
 		new_tasks = sched_balance_newidle(rq, rf);
 
 		/*
