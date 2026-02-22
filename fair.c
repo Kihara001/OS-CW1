@@ -8990,8 +8990,8 @@ again:
 		goto idle;
 	}
 
-	/* --- ここから: Entanglement 相互排他 --- */
 #ifdef CONFIG_SMP
+	/* Entanglement相互排他 */
 	{
 		unsigned int c1 = READ_ONCE(sysctl_entangled_cpu1);
 		unsigned int c2 = READ_ONCE(sysctl_entangled_cpu2);
@@ -8999,49 +8999,25 @@ again:
 
 		if (c1 != c2 && (this_cpu == c1 || this_cpu == c2)) {
 			int other_cpu = (this_cpu == c1) ? c2 : c1;
+			uid_t p_uid = 0;
 
-			if (other_cpu >= 0 && other_cpu < nr_cpu_ids) {
-				kuid_t p_uid;
-				bool has_cred = false;
+			rcu_read_lock();
+			const struct cred *p_cred = rcu_dereference(p->cred);
+			if (p_cred) {
+				p_uid = p_cred->uid.val;
+			}
+			rcu_read_unlock();
 
-				rcu_read_lock();
-				const struct cred *p_cred = rcu_dereference(p->cred);
-				if (p_cred) {
-					p_uid = p_cred->uid;
-					has_cred = true;
-				}
-				rcu_read_unlock();
+			/* 1. 自分のintentを宣言 */
+			sysctl_entanglement_uid[this_cpu] = p_uid;
+			smp_store_mb(sysctl_entanglement_intent[this_cpu], 1);
 
-				if (has_cred) {
-					sysctl_entanglement_uid[this_cpu] = p_uid.val;
-					smp_store_mb(sysctl_entanglement_intent[this_cpu], 1);
-
-					bool conflict = false;
-
-					/* 他のrqのロックは絶対に取らない - READ_ONCEのみ使用 */
-					struct rq *other_rq = cpu_rq(other_cpu);
-					struct task_struct *other_curr = READ_ONCE(other_rq->curr);
-
-					/* RCUなしで最小限の情報だけ取得 */
-					if (other_curr && other_curr->pid != 0) {
-						uid_t other_uid = READ_ONCE(other_curr->cred->uid.val);
-						if (p_uid.val != other_uid) {
-							conflict = true;
-						}
-					} else {
-						/* 相手がアイドル - intentをチェック */
-						if (READ_ONCE(sysctl_entanglement_intent[other_cpu])) {
-							uid_t other_intent_uid = READ_ONCE(sysctl_entanglement_uid[other_cpu]);
-							if (p_uid.val != other_intent_uid && this_cpu > other_cpu) {
-								conflict = true;
-							}
-						}
-					}
-
-					if (conflict) {
-						sysctl_entanglement_intent[this_cpu] = 0;
-						goto idle;  /* return NULLではなくgoto idle */
-					}
+			/* 2. 相手をチェック */
+			if (READ_ONCE(sysctl_entanglement_intent[other_cpu])) {
+				uid_t other_uid = READ_ONCE(sysctl_entanglement_uid[other_cpu]);
+				if (p_uid != other_uid && this_cpu > other_cpu) {
+					/* 競合 - reschedフラグを立てて続行 */
+					set_tsk_need_resched(p);
 				}
 			}
 		} else {
@@ -9049,7 +9025,6 @@ again:
 		}
 	}
 #endif
-	/* --- ここまで --- */
 
 	se = &p->se;
 
