@@ -130,6 +130,7 @@ static unsigned int sysctl_sched_cfs_bandwidth_slice		= 5000UL;
 static unsigned int sysctl_numa_balancing_promote_rate_limit = 65536;
 static unsigned int sysctl_entangled_cpu1 = 0;
 static unsigned int sysctl_entangled_cpu2 = 0;
+static volatile int sysctl_entanglement_yield[NR_CPUS] = {0};
 #endif
 
 #ifdef CONFIG_SYSCTL
@@ -8981,10 +8982,15 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
 
 again:
 	p = pick_task_fair(rq);
-	if (!p)
+	if (!p) {
+#ifdef CONFIG_SMP
+		sysctl_entanglement_yield[cpu_of(rq)] = 0;
+#endif
 		goto idle;
+	}
 
 	/* --- ここから: Entanglement 相互排他チェック --- */
+#ifdef CONFIG_SMP
 	{
 		unsigned int c1 = READ_ONCE(sysctl_entangled_cpu1);
 		unsigned int c2 = READ_ONCE(sysctl_entangled_cpu2);
@@ -9001,42 +9007,91 @@ again:
 			if (other_cpu >= 0 && other_cpu < nr_cpu_ids) {
 				struct rq *other_rq = cpu_rq(other_cpu);
 				struct task_struct *other_curr;
-				bool conflict = false;
+				kuid_t other_uid;
+				bool other_valid = false;
 
-				rcu_read_lock();
-				other_curr = READ_ONCE(other_rq->curr);
-				
-				/* 他のCPUがアイドルタスク(PID 0)ではなく、何らかの処理を実行中の場合 */
-				if (other_curr && other_curr->pid != 0) {
-					/* * 【最重要修正1】クレデンシャルの NULL チェック
-					 * other_curr が終了中(do_exit)の場合、cred は NULL になる。
-					 * task_uid() を直接使わず、rcu_dereference で取得して安全を確認する。
-					 */
-					const struct cred *p_cred = rcu_dereference(p->cred);
-					const struct cred *o_cred = rcu_dereference(other_curr->cred);
+				/* 【重要1】デッドロック回避：相手が空回り(Yield)中なら自分は進む */
+				if (sysctl_entanglement_yield[other_cpu]) {
+					if (sysctl_entanglement_yield[this_cpu]) {
+						/* 両方空回り中なら、CPU番号が小さい方を優先 (タイブレーカー) */
+						if (this_cpu < other_cpu)
+							other_valid = false; /* 相手を無視して自分が進む */
+						else
+							other_valid = true;  /* 自分は待つ */
+					} else {
+						other_valid = false;
+					}
+				} else {
+					other_valid = true;
+				}
 
-					if (p_cred && o_cred) {
-						if (!uid_eq(p_cred->uid, o_cred->uid)) {
-							conflict = true;
+				/* 相手のタスクが有効な場合のみ、安全にUIDを取得 */
+				if (other_valid) {
+					rcu_read_lock();
+					other_curr = READ_ONCE(other_rq->curr);
+					if (other_curr && other_curr->pid != 0) {
+						const struct cred *o_cred = rcu_dereference(other_curr->cred);
+						if (o_cred) {
+							other_uid = o_cred->uid;
+						} else {
+							other_valid = false;
+						}
+					} else {
+						other_valid = false;
+					}
+					rcu_read_unlock();
+				}
+
+				if (other_valid) {
+					struct task_struct *cand = p;
+					bool conflict = false;
+
+					rcu_read_lock();
+					const struct cred *c_cred = rcu_dereference(cand->cred);
+					if (c_cred && !uid_eq(c_cred->uid, other_uid)) {
+						conflict = true;
+					}
+					rcu_read_unlock();
+
+					/* 選ばれたタスクが競合していた場合、別のタスクを探す */
+					if (conflict) {
+						bool found = false;
+						struct task_struct *t;
+
+						/* 【重要2】RBツリーではなく、100%安全なcfs_tasksリストを探索する */
+						list_for_each_entry(t, &rq->cfs_tasks, se.group_node) {
+							if (!t || t->pid == 0) continue;
+							
+							bool t_conflict = false;
+							rcu_read_lock();
+							const struct cred *t_cred = rcu_dereference(t->cred);
+							if (t_cred && !uid_eq(t_cred->uid, other_uid)) {
+								t_conflict = true;
+							}
+							rcu_read_unlock();
+
+							if (!t_conflict) {
+								/* 競合しない安全なタスクを発見！ */
+								p = t;
+								found = true;
+								break;
+							}
+						}
+
+						/* 安全なタスクが一つも無ければ、アイドルへ逃げる(空回り) */
+						if (!found) {
+							sysctl_entanglement_yield[this_cpu] = 1;
+							p = NULL;
+							goto idle;
 						}
 					}
 				}
-				rcu_read_unlock();
-
-				if (conflict) {
-					/* * 【最重要修正2】無限ループとランキュー状態の破損回避
-					 * CFS にタスクが残っていても強制的に CPU を Idle にするため、
-					 * 直前まで動いていたタスク (prev) の退避処理をカーネルの作法通りに
-					 * 完了させてから、NULL を返す。
-					 */
-					if (prev)
-						put_prev_task(rq, prev);
-					
-					return NULL; /* コアスケジューラはこれを見て Idle クラスへ移行する */
-				}
 			}
+			/* タスクが決定したので、空回りフラグを解除 */
+			sysctl_entanglement_yield[this_cpu] = 0;
 		}
 	}
+#endif
 	/* --- ここまで --- */
 
 	se = &p->se;
