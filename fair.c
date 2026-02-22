@@ -123,13 +123,13 @@ int __weak arch_asym_cpu_priority(int cpu)
  * (default: 5 msec, units: microseconds)
  */
 static unsigned int sysctl_sched_cfs_bandwidth_slice		= 5000UL;
+static unsigned int sysctl_entangled_cpu1 = 0;
+static unsigned int sysctl_entangled_cpu2 = 0;
 #endif
 
 #ifdef CONFIG_NUMA_BALANCING
 /* Restrict the NUMA promotion throughput (MB/s) for each target node. */
 static unsigned int sysctl_numa_balancing_promote_rate_limit = 65536;
-static unsigned int sysctl_entangled_cpu1 = 0;
-static unsigned int sysctl_entangled_cpu2 = 0;
 static volatile int sysctl_entanglement_intent[NR_CPUS] = {0};
 static volatile uid_t sysctl_entanglement_uid[NR_CPUS] = {0};
 #endif
@@ -8975,7 +8975,7 @@ static void __set_next_task_fair(struct rq *rq, struct task_struct *p, bool firs
 static void set_next_task_fair(struct rq *rq, struct task_struct *p, bool first);
 
 struct task_struct *
-cpick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 {
 	struct sched_entity *se;
 	struct task_struct *p;
@@ -9015,7 +9015,7 @@ again:
 			}
 			rcu_read_unlock();
 
-			while (conflict && this_cpu > other_cpu) {
+			while (conflict && this_cpu > other_cpu && retries-- > 0) {  /* ← 修正 */
 				cpu_relax();
 
 				rcu_read_lock();
