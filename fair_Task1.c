@@ -9035,6 +9035,42 @@ again:
 	p = pick_task_fair(rq);
 	if (!p)
 		goto idle;
+
+	/* Entangled CPU mutual exclusion - Task 1 */
+	{
+		unsigned int e1 = READ_ONCE(sysctl_entangled_cpu1);
+		unsigned int e2 = READ_ONCE(sysctl_entangled_cpu2);
+
+		/* Only check if entanglement is enabled (e1 != e2) */
+		if (e1 != e2) {
+			int cpu = rq->cpu;
+
+			/* Check if this CPU is one of the entangled pair */
+			if (cpu == (int)e1 || cpu == (int)e2) {
+				int partner = (cpu == (int)e1) ? (int)e2 : (int)e1;
+
+				if (cpu_online(partner)) {
+					struct rq *partner_rq = cpu_rq(partner);
+					struct task_struct *partner_curr = READ_ONCE(partner_rq->curr);
+
+					/*
+					 * Block scheduling if:
+					 * 1. p is a real user task (has mm and pid > 0)
+					 * 2. Partner is running a real user task (not idle, not kernel thread)
+					 * 3. They have different UIDs
+					 */
+					if (p->mm && p->pid > 0 &&
+					    partner_curr &&
+					    partner_curr->mm &&
+					    partner_curr->pid > 0 &&
+					    task_uid(partner_curr).val != task_uid(p).val) {
+						goto idle;
+					}
+				}
+			}
+		}
+	}
+
 	se = &p->se;
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
