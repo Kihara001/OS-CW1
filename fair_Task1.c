@@ -9030,7 +9030,7 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
 	struct sched_entity *se;
 	struct task_struct *p;
 	int new_tasks;
-	bool entangled_block = false;
+	int entangled_block = 0;
 
 again:
 	p = pick_task_fair(rq);
@@ -9062,11 +9062,12 @@ again:
 					 */
 					if (p->mm && p->pid > 0 &&
 					    partner_curr &&
-						partner_curr->mm &&
-						partner_curr->pid > 0 &&
-						task_uid(partner_curr).val != task_uid(p).val) {
-						update_idle_rq_clock_pelt(rq);
-						return NULL;
+					    partner_curr->mm &&
+					    partner_curr->pid > 0 &&
+					    task_uid(partner_curr).val != task_uid(p).val) {
+						entangled_block = 1;
+						p = NULL;
+						goto idle;
 					}
 				}
 			}
