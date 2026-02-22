@@ -9062,11 +9062,11 @@ again:
 					 */
 					if (p->mm && p->pid > 0 &&
 					    partner_curr &&
-					    partner_curr->mm &&
-					    partner_curr->pid > 0 &&
-					    task_uid(partner_curr).val != task_uid(p).val) {
-						entangled_block = true;
-						goto idle;
+						partner_curr->mm &&
+						partner_curr->pid > 0 &&
+						task_uid(partner_curr).val != task_uid(p).val) {
+						update_idle_rq_clock_pelt(rq);
+						return NULL;
 					}
 				}
 			}
