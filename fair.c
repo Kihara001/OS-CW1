@@ -8975,7 +8975,7 @@ static void __set_next_task_fair(struct rq *rq, struct task_struct *p, bool firs
 static void set_next_task_fair(struct rq *rq, struct task_struct *p, bool first);
 
 struct task_struct *
-pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+cpick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 {
 	struct sched_entity *se;
 	struct task_struct *p;
@@ -8983,15 +8983,13 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
 
 again:
 	p = pick_task_fair(rq);
-	if (!p) {
-#ifdef CONFIG_SMP
-		sysctl_entanglement_intent[cpu_of(rq)] = 0;
-#endif
+	if (!p)
 		goto idle;
-	}
 
+	se = &p->se;
+
+/* ===== ここから挿入 ===== */
 #ifdef CONFIG_SMP
-	/* Entanglement相互排他 */
 	{
 		unsigned int c1 = READ_ONCE(sysctl_entangled_cpu1);
 		unsigned int c2 = READ_ONCE(sysctl_entangled_cpu2);
@@ -8999,34 +8997,41 @@ again:
 
 		if (c1 != c2 && (this_cpu == c1 || this_cpu == c2)) {
 			int other_cpu = (this_cpu == c1) ? c2 : c1;
-			uid_t p_uid = 0;
+			struct rq *other_rq = cpu_rq(other_cpu);
+			struct task_struct *other_curr;
+			uid_t p_uid = 0, other_uid = 0;
+			bool conflict = false;
 
 			rcu_read_lock();
-			const struct cred *p_cred = rcu_dereference(p->cred);
-			if (p_cred) {
-				p_uid = p_cred->uid.val;
+			if (p->cred)
+				p_uid = __kuid_val(p->cred->uid);
+
+			other_curr = READ_ONCE(other_rq->curr);
+			if (other_curr && other_curr->pid != 0 && other_curr->cred) {
+				other_uid = __kuid_val(other_curr->cred->uid);
+				if (p_uid != other_uid)
+					conflict = true;
 			}
 			rcu_read_unlock();
 
-			/* 1. 自分のintentを宣言 */
-			sysctl_entanglement_uid[this_cpu] = p_uid;
-			smp_store_mb(sysctl_entanglement_intent[this_cpu], 1);
+			while (conflict && this_cpu > other_cpu) {
+				cpu_relax();
 
-			/* 2. 相手をチェック */
-			if (READ_ONCE(sysctl_entanglement_intent[other_cpu])) {
-				uid_t other_uid = READ_ONCE(sysctl_entanglement_uid[other_cpu]);
-				if (p_uid != other_uid && this_cpu > other_cpu) {
-					/* 競合 - reschedフラグを立てて続行 */
-					set_tsk_need_resched(p);
+				rcu_read_lock();
+				other_curr = READ_ONCE(other_rq->curr);
+				if (!other_curr || other_curr->pid == 0) {
+					conflict = false;
+				} else if (other_curr->cred) {
+					other_uid = __kuid_val(other_curr->cred->uid);
+					if (p_uid == other_uid)
+						conflict = false;
 				}
+				rcu_read_unlock();
 			}
-		} else {
-			sysctl_entanglement_intent[this_cpu] = 0;
 		}
 	}
 #endif
-
-	se = &p->se;
+/* ===== ここまで挿入 ===== */
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	if (prev->sched_class != &fair_sched_class)
