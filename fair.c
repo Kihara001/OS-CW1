@@ -9013,48 +9013,34 @@ again:
 				rcu_read_unlock();
 
 				if (has_cred) {
-					/* 相手を見る前に「自分はこのUIDを実行する」と宣言 (Petersonのアルゴリズム) */
 					sysctl_entanglement_uid[this_cpu] = p_uid.val;
-					smp_store_mb(sysctl_entanglement_intent[this_cpu], 1); // メモリバリアで同期
+					smp_store_mb(sysctl_entanglement_intent[this_cpu], 1);
 
 					bool conflict = false;
+
+					/* 他のrqのロックは絶対に取らない - READ_ONCEのみ使用 */
 					struct rq *other_rq = cpu_rq(other_cpu);
-					struct task_struct *other_curr;
-					bool other_valid = false;
-					kuid_t other_curr_uid;
+					struct task_struct *other_curr = READ_ONCE(other_rq->curr);
 
-					rcu_read_lock();
-					other_curr = READ_ONCE(other_rq->curr);
+					/* RCUなしで最小限の情報だけ取得 */
 					if (other_curr && other_curr->pid != 0) {
-						const struct cred *o_cred = rcu_dereference(other_curr->cred);
-						if (o_cred) {
-							other_curr_uid = o_cred->uid;
-							other_valid = true;
-						}
-					}
-					rcu_read_unlock();
-
-					/* 競合の判定 */
-					if (other_valid) {
-						if (p_uid.val != other_curr_uid.val) {
+						uid_t other_uid = READ_ONCE(other_curr->cred->uid.val);
+						if (p_uid.val != other_uid) {
 							conflict = true;
 						}
 					} else {
-						/* 相手がアイドルでも、同時に起動しようとしていたらタイブレーカー発動 */
-						if (sysctl_entanglement_intent[other_cpu]) {
-							uid_t other_intent_uid = sysctl_entanglement_uid[other_cpu];
-							if (p_uid.val != other_intent_uid) {
-								if (this_cpu > other_cpu) {
-									conflict = true; /* 番号が大きい方が身を引く */
-								}
+						/* 相手がアイドル - intentをチェック */
+						if (READ_ONCE(sysctl_entanglement_intent[other_cpu])) {
+							uid_t other_intent_uid = READ_ONCE(sysctl_entanglement_uid[other_cpu]);
+							if (p_uid.val != other_intent_uid && this_cpu > other_cpu) {
+								conflict = true;
 							}
 						}
 					}
 
-					/* 競合時の究極の安全策 */
 					if (conflict) {
-						sysctl_entanglement_intent[this_cpu] = 0;  // intentもクリア
-						goto idle;  // 正規のアイドルパスを使う
+						sysctl_entanglement_intent[this_cpu] = 0;
+						goto idle;  /* return NULLではなくgoto idle */
 					}
 				}
 			}
