@@ -67,6 +67,7 @@ struct user_cpu_accounting {
 static struct user_cpu_accounting global_user_accounting[MAX_TRACKED_USERS];
 static int global_user_count;
 static DEFINE_SPINLOCK(user_accounting_lock);
+static unsigned long last_decay_jiffies = 0;
 
 static struct user_cpu_accounting *find_user_accounting(uid_t uid)
 {
@@ -1292,6 +1293,7 @@ static void update_curr(struct cfs_rq *cfs_rq)
 		update_curr_task(p, delta_exec);
 
 		/* ===== Task 2B: User equity via vruntime adjustment ===== */
+		/* ===== Task 2B: User equity via vruntime adjustment ===== */
 		{
 			uid_t uid;
 			rcu_read_lock();
@@ -1302,10 +1304,22 @@ static void update_curr(struct cfs_rq *cfs_rq)
 				struct user_cpu_accounting *ua = find_user_accounting(uid);
 				if (ua) {
 					u64 avg_runtime;
+					unsigned long flags;
+					unsigned long now = jiffies; /* 現在のカーネル時刻を取得 */
 					
 					/* Add runtime (with lock) */
-					unsigned long flags;
 					spin_lock_irqsave(&user_accounting_lock, flags);
+
+					/* 【追加】1秒 (HZ) 以上経過していたら、全ユーザーの履歴を半分に減衰させる */
+					if (time_after(now, last_decay_jiffies + HZ)) {
+						int i;
+						for (i = 0; i < global_user_count; i++) {
+							/* 履歴を右シフトして半分にする */
+							global_user_accounting[i].total_runtime_ns >>= 1;
+						}
+						last_decay_jiffies = now;
+					}
+
 					ua->total_runtime_ns += delta_exec;
 					spin_unlock_irqrestore(&user_accounting_lock, flags);
 
@@ -1313,7 +1327,9 @@ static void update_curr(struct cfs_rq *cfs_rq)
 					avg_runtime = get_average_user_runtime();
 					if (avg_runtime > 0 && ua->total_runtime_ns > avg_runtime) {
 						u64 excess = ua->total_runtime_ns - avg_runtime;
-						curr->vruntime += excess >> 1;
+						
+						/* ペナルティが大きくなりすぎないように調整 */
+						curr->vruntime += excess >> 4; 
 					}
 				}
 			}
