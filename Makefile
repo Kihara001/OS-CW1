@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2
-OBJS = monitor.o utils.o
 TARGET = monitor.exe
+OBJS = monitor.o utils.o
 
 all: $(TARGET)
 
@@ -15,6 +15,6 @@ utils.o: utils.c utils.h
 	$(CC) $(CFLAGS) -c utils.c
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(TARGET) $(OBJS)
 
 .PHONY: all clean
