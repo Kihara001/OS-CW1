@@ -115,29 +115,6 @@ static struct user_cpu_accounting *find_user_accounting(uid_t uid)
     return NULL;
 }
 
-static u64 get_average_user_runtime(void)
-{
-    u64 total = 0;
-    int i;
-    unsigned long flags;
-
-    spin_lock_irqsave(&user_accounting_lock, flags);
-    
-    if (global_user_count == 0) {
-        spin_unlock_irqrestore(&user_accounting_lock, flags);
-        return 0;
-    }
-
-    for (i = 0; i < global_user_count; i++) {
-        total += global_user_accounting[i].total_runtime_ns;
-    }
-    
-    total = total / global_user_count;
-    spin_unlock_irqrestore(&user_accounting_lock, flags);
-    
-    return total;
-}
-
 
 /*
  * The initial- and re-scaling of tunables is configurable
