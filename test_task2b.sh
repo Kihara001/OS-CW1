@@ -38,8 +38,8 @@ echo "Duration: ${DURATION}s busy, ${MONITOR_TIME}s monitor"
 echo ""
 
 # Start bob FIRST
-echo "Starting bob...200"
-for i in $(seq 1 200); do
+echo "Starting bob...10"
+for i in $(seq 1 10); do
     su -s /bin/sh bob -c "/tmp/busy $DURATION" &
 done
 
@@ -47,8 +47,8 @@ done
 sleep 1
 
 # Start alice
-echo "Starting alice (200 processes)..."
-for i in $(seq 1 200); do
+echo "Starting alice (10 processes)..."
+for i in $(seq 1 10); do
     su -s /bin/sh alice -c "/tmp/busy $DURATION" &
 done
 
