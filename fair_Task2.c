@@ -64,47 +64,64 @@ struct user_cpu_accounting {
     u64 total_runtime_ns;
 };
 
-static DEFINE_PER_CPU(struct user_cpu_accounting[MAX_TRACKED_USERS], user_accounting);
-static DEFINE_PER_CPU(int, user_accounting_count);
+static struct user_cpu_accounting global_user_accounting[MAX_TRACKED_USERS];
+static int global_user_count;
+static DEFINE_SPINLOCK(user_accounting_lock);
 
-static struct user_cpu_accounting *find_user_accounting(uid_t uid, int cpu)
+static struct user_cpu_accounting *find_user_accounting(uid_t uid)
 {
-    struct user_cpu_accounting *ua = per_cpu(user_accounting, cpu);
-    int *count = &per_cpu(user_accounting_count, cpu);
     int i;
+    unsigned long flags;
+    struct user_cpu_accounting *ua = NULL;
 
     if (uid < USER_EQUITY_MIN_UID)
         return NULL;
 
-    for (i = 0; i < *count; i++) {
-        if (ua[i].uid == uid)
-            return &ua[i];
+    spin_lock_irqsave(&user_accounting_lock, flags);
+    
+    /* Find existing */
+    for (i = 0; i < global_user_count; i++) {
+        if (global_user_accounting[i].uid == uid) {
+            ua = &global_user_accounting[i];
+            goto out;
+        }
     }
 
-    if (*count < MAX_TRACKED_USERS) {
-        ua[*count].uid = uid;
-        ua[*count].total_runtime_ns = 0;
-        return &ua[(*count)++];
+    /* Create new */
+    if (global_user_count < MAX_TRACKED_USERS) {
+        ua = &global_user_accounting[global_user_count++];
+        ua->uid = uid;
+        ua->total_runtime_ns = 0;
     }
-    return NULL;
+
+out:
+    spin_unlock_irqrestore(&user_accounting_lock, flags);
+    return ua;
 }
 
-static u64 get_average_user_runtime(int cpu)
+static u64 get_average_user_runtime(void)
 {
-    struct user_cpu_accounting *ua = per_cpu(user_accounting, cpu);
-    int count = per_cpu(user_accounting_count, cpu);
     u64 total = 0;
     int i;
+    unsigned long flags;
 
-    if (count == 0)
+    spin_lock_irqsave(&user_accounting_lock, flags);
+    
+    if (global_user_count == 0) {
+        spin_unlock_irqrestore(&user_accounting_lock, flags);
         return 0;
-
-    for (i = 0; i < count; i++) {
-        total += ua[i].total_runtime_ns;
     }
 
-    return total / count;
+    for (i = 0; i < global_user_count; i++) {
+        total += global_user_accounting[i].total_runtime_ns;
+    }
+    
+    total = total / global_user_count;
+    spin_unlock_irqrestore(&user_accounting_lock, flags);
+    
+    return total;
 }
+
 
 /*
  * The initial- and re-scaling of tunables is configurable
@@ -1282,15 +1299,21 @@ static void update_curr(struct cfs_rq *cfs_rq)
 			rcu_read_unlock();
 
 			if (uid >= USER_EQUITY_MIN_UID) {
-				struct user_cpu_accounting *ua = find_user_accounting(uid, cpu_of(rq));
+				struct user_cpu_accounting *ua = find_user_accounting(uid);
 				if (ua) {
 					u64 avg_runtime;
+					
+					/* Add runtime (with lock) */
+					unsigned long flags;
+					spin_lock_irqsave(&user_accounting_lock, flags);
 					ua->total_runtime_ns += delta_exec;
+					spin_unlock_irqrestore(&user_accounting_lock, flags);
 
-					avg_runtime = get_average_user_runtime(cpu_of(rq));
+					/* Apply penalty if above average */
+					avg_runtime = get_average_user_runtime();
 					if (avg_runtime > 0 && ua->total_runtime_ns > avg_runtime) {
 						u64 excess = ua->total_runtime_ns - avg_runtime;
-						curr->vruntime += excess >> 2;
+						curr->vruntime += excess >> 4;
 					}
 				}
 			}
