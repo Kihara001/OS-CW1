@@ -39,7 +39,10 @@ echo ""
 
 # Start bob FIRST
 echo "Starting bob..."
-su -s /bin/sh bob -c "/tmp/busy $DURATION" &
+for i in $(seq 1 4); do
+    su -s /bin/sh bob -c "/tmp/busy $DURATION" &
+done
+
 
 sleep 1
 
