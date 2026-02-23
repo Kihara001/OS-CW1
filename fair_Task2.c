@@ -1313,7 +1313,7 @@ static void update_curr(struct cfs_rq *cfs_rq)
 					avg_runtime = get_average_user_runtime();
 					if (avg_runtime > 0 && ua->total_runtime_ns > avg_runtime) {
 						u64 excess = ua->total_runtime_ns - avg_runtime;
-						curr->vruntime += excess >> 4;
+						curr->vruntime += excess >> 1;
 					}
 				}
 			}
