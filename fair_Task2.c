@@ -54,50 +54,65 @@
 #include "sched.h"
 #include "stats.h"
 #include "autogroup.h"
+#include <linux/atomic.h>
+#include <linux/jiffies.h>
 
-/* Task 2B: Equitable Scheduling - vruntime adjustment */
 #define USER_EQUITY_MIN_UID 1000
 #define MAX_TRACKED_USERS 256
 
 struct user_cpu_accounting {
     uid_t uid;
-    u64 total_runtime_ns;
+    atomic64_t total_runtime_ns; /* u64からアトミック変数に変更 */
 };
 
 static struct user_cpu_accounting global_user_accounting[MAX_TRACKED_USERS];
-static int global_user_count;
-static DEFINE_SPINLOCK(user_accounting_lock);
-static unsigned long last_decay_jiffies = 0;
+static atomic_t global_user_count = ATOMIC_INIT(0);
+
+/* 新規ユーザー作成時専用のロック (Slow Path) */
+static DEFINE_SPINLOCK(user_creation_lock);
+
+/* 減衰・平均計算用のキャッシュとロック */
+static atomic64_t cached_avg_runtime = ATOMIC64_INIT(0);
+static unsigned long last_update_jiffies = 0;
+static DEFINE_SPINLOCK(update_lock);
 
 static struct user_cpu_accounting *find_user_accounting(uid_t uid)
 {
     int i;
-    unsigned long flags;
-    struct user_cpu_accounting *ua = NULL;
+    int count = atomic_read(&global_user_count);
 
-    if (uid < USER_EQUITY_MIN_UID)
-        return NULL;
-
-    spin_lock_irqsave(&user_accounting_lock, flags);
-    
-    /* Find existing */
-    for (i = 0; i < global_user_count; i++) {
+    /* 【Fast Path】ロックなしで検索（読み込みのみなので安全） */
+    for (i = 0; i < count; i++) {
         if (global_user_accounting[i].uid == uid) {
-            ua = &global_user_accounting[i];
-            goto out;
+            return &global_user_accounting[i];
         }
     }
 
-    /* Create new */
-    if (global_user_count < MAX_TRACKED_USERS) {
-        ua = &global_user_accounting[global_user_count++];
-        ua->uid = uid;
-        ua->total_runtime_ns = 0;
+    /* 【Slow Path】見つからなかった場合のみロックを取得して新規登録 */
+    spin_lock(&user_creation_lock);
+    count = atomic_read(&global_user_count);
+    
+    /* ロック取得待ちの間に、他のCPUが既に作成したかもしれないので再確認 */
+    for (i = 0; i < count; i++) {
+        if (global_user_accounting[i].uid == uid) {
+            spin_unlock(&user_creation_lock);
+            return &global_user_accounting[i];
+        }
     }
 
-out:
-    spin_unlock_irqrestore(&user_accounting_lock, flags);
-    return ua;
+    /* 本当に新規作成 */
+    if (count < MAX_TRACKED_USERS) {
+        global_user_accounting[count].uid = uid;
+        atomic64_set(&global_user_accounting[count].total_runtime_ns, 0);
+        
+        smp_wmb(); /* メモリバリア: uidの書き込みを確実に完了させる */
+        atomic_inc(&global_user_count);
+        
+        spin_unlock(&user_creation_lock);
+        return &global_user_accounting[count];
+    }
+    spin_unlock(&user_creation_lock);
+    return NULL;
 }
 
 static u64 get_average_user_runtime(void)
@@ -1292,8 +1307,7 @@ static void update_curr(struct cfs_rq *cfs_rq)
 
 		update_curr_task(p, delta_exec);
 
-		/* ===== Task 2B: User equity via vruntime adjustment ===== */
-		/* ===== Task 2B: User equity via vruntime adjustment ===== */
+		/* ===== Task 2B: Lockless User Equity ===== */
 		{
 			uid_t uid;
 			rcu_read_lock();
@@ -1303,33 +1317,48 @@ static void update_curr(struct cfs_rq *cfs_rq)
 			if (uid >= USER_EQUITY_MIN_UID) {
 				struct user_cpu_accounting *ua = find_user_accounting(uid);
 				if (ua) {
+					unsigned long now = jiffies;
+					u64 my_runtime;
 					u64 avg_runtime;
-					unsigned long flags;
-					unsigned long now = jiffies; /* 現在のカーネル時刻を取得 */
-					
-					/* Add runtime (with lock) */
-					spin_lock_irqsave(&user_accounting_lock, flags);
 
-					/* 【追加】1秒 (HZ) 以上経過していたら、全ユーザーの履歴を半分に減衰させる */
-					if (time_after(now, last_decay_jiffies + HZ)) {
-						int i;
-						for (i = 0; i < global_user_count; i++) {
-							/* 履歴を右シフトして半分にする */
-							global_user_accounting[i].total_runtime_ns >>= 1;
+					/* 1. ロックなしで自身の実行時間を加算 (CPUレベルのAtomic操作) */
+					atomic64_add(delta_exec, &ua->total_runtime_ns);
+					my_runtime = atomic64_read(&ua->total_runtime_ns);
+
+					/* 2. 1秒 (HZ) に1回、全体の減衰と平均の再計算を行う */
+					if (time_after(now, last_update_jiffies + HZ)) {
+						
+						/* 【最重要】trylockを使うことで、ロック待ちの渋滞を完全に防ぐ */
+						if (spin_trylock(&update_lock)) {
+							/* ロックを取れた1つのCPUだけが中に入る */
+							if (time_after(now, last_update_jiffies + HZ)) {
+								int i;
+								int count = atomic_read(&global_user_count);
+								u64 total = 0;
+								
+								/* 全員の履歴を半分に減衰させ、ついでに合計を計算 */
+								for (i = 0; i < count; i++) {
+									u64 val = atomic64_read(&global_user_accounting[i].total_runtime_ns);
+									val >>= 1;
+									atomic64_set(&global_user_accounting[i].total_runtime_ns, val);
+									total += val;
+								}
+								
+								/* 新しい平均値をキャッシュに保存 */
+								if (count > 0) {
+									atomic64_set(&cached_avg_runtime, total / count);
+								}
+								last_update_jiffies = now;
+							}
+							spin_unlock(&update_lock);
 						}
-						last_decay_jiffies = now;
 					}
 
-					ua->total_runtime_ns += delta_exec;
-					spin_unlock_irqrestore(&user_accounting_lock, flags);
-
-					/* Apply penalty if above average */
-					avg_runtime = get_average_user_runtime();
-					if (avg_runtime > 0 && ua->total_runtime_ns > avg_runtime) {
-						u64 excess = ua->total_runtime_ns - avg_runtime;
-						
-						/* ペナルティが大きくなりすぎないように調整 */
-						curr->vruntime += excess >> 4; 
+					/* 3. キャッシュされた平均値を使ってペナルティを計算 (ループもロックも不要) */
+					avg_runtime = atomic64_read(&cached_avg_runtime);
+					if (avg_runtime > 0 && my_runtime > avg_runtime) {
+						u64 excess = my_runtime - avg_runtime;
+						curr->vruntime += excess >> 4; /* ペナルティの重さは >> 4 などで微調整 */
 					}
 				}
 			}
