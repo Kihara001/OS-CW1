@@ -55,6 +55,7 @@
 #include "stats.h"
 #include "autogroup.h"
 
+/* Task 2B: Equitable Scheduling - vruntime adjustment */
 #define USER_EQUITY_MIN_UID 1000
 #define MAX_TRACKED_USERS 256
 
@@ -88,10 +89,21 @@ static struct user_cpu_accounting *find_user_accounting(uid_t uid, int cpu)
     return NULL;
 }
 
-static u64 get_user_runtime(uid_t uid, int cpu)
+static u64 get_average_user_runtime(int cpu)
 {
-    struct user_cpu_accounting *ua = find_user_accounting(uid, cpu);
-    return ua ? ua->total_runtime_ns : 0;
+    struct user_cpu_accounting *ua = per_cpu(user_accounting, cpu);
+    int count = per_cpu(user_accounting_count, cpu);
+    u64 total = 0;
+    int i;
+
+    if (count == 0)
+        return 0;
+
+    for (i = 0; i < count; i++) {
+        total += ua[i].total_runtime_ns;
+    }
+
+    return total / count;
 }
 
 /*
@@ -1262,16 +1274,25 @@ static void update_curr(struct cfs_rq *cfs_rq)
 
 		update_curr_task(p, delta_exec);
 
-		/* ===== Task 2B: User equity accounting ===== */
+		/* ===== Task 2B: User equity via vruntime adjustment ===== */
 		{
 			uid_t uid;
 			rcu_read_lock();
 			uid = p->cred ? __kuid_val(p->cred->uid) : 0;
 			rcu_read_unlock();
+
 			if (uid >= USER_EQUITY_MIN_UID) {
 				struct user_cpu_accounting *ua = find_user_accounting(uid, cpu_of(rq));
-				if (ua)
+				if (ua) {
+					u64 avg_runtime;
 					ua->total_runtime_ns += delta_exec;
+
+					avg_runtime = get_average_user_runtime(cpu_of(rq));
+					if (avg_runtime > 0 && ua->total_runtime_ns > avg_runtime) {
+						u64 excess = ua->total_runtime_ns - avg_runtime;
+						curr->vruntime += excess >> 10;
+					}
+				}
 			}
 		}
 		/* ===== End Task 2B ===== */
@@ -9020,51 +9041,6 @@ again:
 	if (!p)
 		goto idle;
 	se = &p->se;
-
-		/* ===== Task 2B: Prefer under-served users ===== */
-	{
-		uid_t p_uid;
-		rcu_read_lock();
-		p_uid = p->cred ? __kuid_val(p->cred->uid) : 0;
-		rcu_read_unlock();
-
-		if (p_uid >= USER_EQUITY_MIN_UID) {
-			struct cfs_rq *cfs_rq = &rq->cfs;
-			struct rb_node *node;
-			u64 min_runtime = get_user_runtime(p_uid, cpu_of(rq));
-			struct task_struct *best_p = NULL;
-			struct sched_entity *best_se = NULL;
-
-			for (node = rb_first_cached(&cfs_rq->tasks_timeline); node; node = rb_next(node)) {
-				struct sched_entity *se_iter = rb_entry(node, struct sched_entity, run_node);
-				if (entity_is_task(se_iter)) {
-					struct task_struct *p_iter = task_of(se_iter);
-					uid_t uid_iter;
-					u64 runtime_iter;
-
-					rcu_read_lock();
-					uid_iter = p_iter->cred ? __kuid_val(p_iter->cred->uid) : 0;
-					rcu_read_unlock();
-
-					if (uid_iter >= USER_EQUITY_MIN_UID) {
-						runtime_iter = get_user_runtime(uid_iter, cpu_of(rq));
-						if (runtime_iter < min_runtime) {
-							min_runtime = runtime_iter;
-							best_p = p_iter;
-							best_se = se_iter;
-						}
-					}
-				}
-			}
-
-			if (best_p && best_p != p) {
-				p = best_p;
-				se = best_se;
-			}
-		}
-	}
-	/* ===== End Task 2B ===== */
-
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	if (prev->sched_class != &fair_sched_class)
