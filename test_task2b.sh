@@ -1,5 +1,6 @@
 #!/bin/bash
-DURATION=25
+DURATION=30
+MONITOR_TIME=20
 
 echo "=== Task 2B Test ==="
 
@@ -25,20 +26,42 @@ chmod +x /tmp/busy
 id alice &>/dev/null || useradd -m alice
 id bob &>/dev/null || useradd -m bob
 
-echo "Starting: alice=10 processes, bob=1 process"
+# Show UIDs
+echo "UIDs: alice=$(id -u alice), bob=$(id -u bob)"
 
-# Start processes using su -s /bin/sh
+echo "Starting: alice=10 processes, bob=1 process (duration=${DURATION}s)"
+
+# Start bob FIRST
+su -s /bin/sh bob -c "/tmp/busy $DURATION" &
+BOB_PID=$!
+sleep 1
+
+# Start alice's processes
 for i in $(seq 1 10); do
     su -s /bin/sh alice -c "/tmp/busy $DURATION" &
 done
-su -s /bin/sh bob -c "/tmp/busy $DURATION" &
 
-sleep 2
+# Wait for processes to actually start
+sleep 3
+
+echo ""
 echo "Processes running:"
 ps aux | grep busy | grep -v grep
+echo ""
 
-echo "Monitoring..."
-./monitor.exe $((DURATION - 3))
+ALICE_COUNT=$(ps aux | grep busy | grep alice | grep -v grep | wc -l)
+BOB_COUNT=$(ps aux | grep busy | grep bob | grep -v grep | wc -l)
+echo "Count: alice=$ALICE_COUNT, bob=$BOB_COUNT"
 
+if [ "$ALICE_COUNT" -eq 0 ] || [ "$BOB_COUNT" -eq 0 ]; then
+    echo "ERROR: Not all processes started!"
+    exit 1
+fi
+
+echo ""
+echo "Monitoring for ${MONITOR_TIME}s..."
+./monitor.exe $MONITOR_TIME
+
+echo ""
 echo "=== Done ==="
-
+echo "Expected: alice and bob should have SIMILAR CPU times if Task 2B works"
